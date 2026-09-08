@@ -8,8 +8,18 @@ connection logic of its own beyond what's passed in.
 
 import json
 import re
+from collections import OrderedDict
 
-from config import MAX_ROWS, MAX_TABLES, bedrock, MODEL_ID
+from imcm_commons import imcm_logger as logger
+
+from config import (
+    MAX_ROWS,
+    MAX_TABLES,
+    MODEL_ID,
+    TABLE_SELECTION_CACHE_SIZE,
+    TABLE_SHORTLIST_K,
+    bedrock,
+)
 from glossary import (
     TABLE_ALIAS_MAP,
     column_descriptions_block,
@@ -17,6 +27,13 @@ from glossary import (
     few_shot_block,
     relationships_block,
 )
+from session_memory import shortlist_debug
+
+# Stage 1 (table selection) result cache, keyed on (normalized question,
+# catalog fingerprint) so a schema change naturally invalidates stale
+# entries. Repeated/near-identical questions (e.g. a BI dashboard re-issuing
+# the same question) skip the table-selection Bedrock call on a warm hit.
+_TABLE_SELECTION_CACHE = OrderedDict()
 
 
 def resolve_tables(names, catalog):
@@ -61,7 +78,36 @@ def detailed_schema_text(catalog, table_names):
 
 
 def select_relevant_tables(query, catalog):
-    """Stage 1: ask the model which table(s) are needed for this question."""
+    """Stage 1: ask the model which table(s) are needed for this question.
+    Cached per (normalized question, catalog fingerprint) -- see
+    _TABLE_SELECTION_CACHE above.
+
+    Stage 0 runs first: a lexical shortlist bounds this prompt to a constant
+    size. Without it, compact_catalog_text emits EVERY table with EVERY column
+    name -- measured at ~200,000 characters (~50,000 tokens) for a 300-table
+    Vault schema, versus ~14,000 after shortlisting. That matters now that
+    callers no longer pass `Table` and this call runs on every new question.
+    """
+    cache_key = (query.strip().lower(), hash(compact_catalog_text(catalog)))
+    cached = _TABLE_SELECTION_CACHE.get(cache_key)
+    if cached is not None:
+        _TABLE_SELECTION_CACHE.move_to_end(cache_key)
+        return list(cached)
+
+    if len(catalog) > TABLE_SHORTLIST_K:
+        ranked = shortlist_debug(query, catalog, k=TABLE_SHORTLIST_K)
+        logger.log_info(
+            f"Table shortlist: {len(catalog)} table(s) -> {len(ranked)} candidate(s); "
+            f"top scores: {ranked[:8]}"
+        )
+        if ranked and ranked[0][0] == 0:
+            logger.log_info(
+                "Table shortlist WARNING: top candidate scored 0 -- the question shares "
+                "no vocabulary with any table or column name, so the correct table may "
+                "be outside the shortlist. Consider a glossary alias."
+            )
+        catalog = {t: catalog[t] for _, t in ranked}
+
     prompt = (
         "You are choosing which database table(s) are needed to answer a question.\n"
         f"There are {len(catalog)} available tables. For each, the table name and its "
@@ -86,7 +132,13 @@ def select_relevant_tables(query, catalog):
         parsed = json.loads(raw)
     except (ValueError, TypeError):
         parsed = {}
-    return resolve_tables(parsed.get("tables"), catalog)[:MAX_TABLES]
+    resolved = resolve_tables(parsed.get("tables"), catalog)[:MAX_TABLES]
+
+    _TABLE_SELECTION_CACHE[cache_key] = resolved
+    _TABLE_SELECTION_CACHE.move_to_end(cache_key)
+    if len(_TABLE_SELECTION_CACHE) > TABLE_SELECTION_CACHE_SIZE:
+        _TABLE_SELECTION_CACHE.popitem(last=False)
+    return list(resolved)
 
 
 # --------------------------------------------------------------------------
@@ -120,7 +172,8 @@ def _extract_sql(resp):
     return sql.rstrip(";").strip()
 
 
-def generate_sql(query, schema_text, database, schema, value_samples_text="", table_names=None, conn=None):
+def generate_sql(query, schema_text, database, schema, value_samples_text="", table_names=None,
+                 conn=None, history_text="", requery_text=""):
     table_names = table_names or []
     samples_section = (
         f"\nActual data values observed (IMPORTANT -- match these exactly, "
@@ -132,6 +185,21 @@ def generate_sql(query, schema_text, database, schema, value_samples_text="", ta
     relationships_section = relationships_block(conn, database, schema, table_names) if conn else ""
     few_shot_section = few_shot_block()
     query_type = classify_query_type(query, table_names)
+
+    # Conversation context goes AFTER the schema/glossary/samples so the stable,
+    # cacheable part of the prompt stays at the front -- prompt caching is a
+    # prefix match, so a byte change early invalidates everything after it.
+    history_section = f"\n{history_text}\n" if history_text else ""
+    requery_section = f"\n{requery_text}\n" if requery_text else ""
+    followup_rules = (
+        "- This question continues the conversation above. If it REFINES the "
+        "previous question, start from the previous SQL and change ONLY what the "
+        "user asked to change -- keep every other filter exactly as it was. "
+        "Silently dropping a filter the user still expects produces a query that "
+        "runs fine and returns the wrong rows, which is the worst outcome here.\n"
+        "- If the question instead starts a new topic, ignore the previous SQL.\n"
+        if history_text else ""
+    )
 
     type_guidance = {
         "aggregate": (
@@ -183,13 +251,38 @@ def generate_sql(query, schema_text, database, schema, value_samples_text="", ta
         "Some table names are also SQL reserved words (e.g. USER) -- when referencing "
         "such a table, ALWAYS double-quote just the table name part, e.g. "
         f"FROM {database}.{schema}.\"USER\" U, never FROM USER U or FROM {database}.{schema}.USER U.\n"
-        f"- Always include a LIMIT of at most {MAX_ROWS} rows unless it is an aggregate.\n\n"
+        f"- Always include a LIMIT of at most {MAX_ROWS} rows unless it is an aggregate.\n"
+        "- Match the term the user actually used and do NOT broaden it to adjacent "
+        "values. If they say 'closed', filter on the single value that means closed "
+        "-- do not also include 'canceled__v' or 'completed__v'. Use IN(...) with "
+        "several values only when the question itself names several.\n"
+        "- Only filter on a column whose real values are shown above, or whose "
+        "meaning is unambiguous from its name. Never invent a filter on an opaque "
+        "surrogate-key column (values like 'V0V000000002060') to stand in for a "
+        "concept such as a country, region or currency. If you cannot tell which "
+        "column holds a value the question mentions, omit that filter rather than "
+        "guessing a column.\n"
+        f"{followup_rules}"
+        f"{history_section}"
+        f"{requery_section}\n"
         f"Question: {query}"
+    )
+    logger.log_info(
+        f"SQL generation prompt: {len(prompt)} chars (~{len(prompt)//4} tokens) "
+        f"[schema={len(schema_text)} samples={len(value_samples_text)} "
+        f"history={len(history_text)} requery={len(requery_text)}]"
     )
     resp = bedrock.converse(
         modelId=MODEL_ID,
         messages=[{"role": "user", "content": [{"text": prompt}]}],
         inferenceConfig={"maxTokens": 700, "temperature": 0},
+    )
+    usage = resp.get("usage") or {}
+    metrics = resp.get("metrics") or {}
+    logger.log_info(
+        f"SQL generation Bedrock usage: input={usage.get('inputTokens')} "
+        f"output={usage.get('outputTokens')} server_latency_ms={metrics.get('latencyMs')} "
+        f"stop_reason={resp.get('stopReason')}"
     )
     return _extract_sql(resp)
 

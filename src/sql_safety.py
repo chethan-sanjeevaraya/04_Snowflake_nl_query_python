@@ -9,7 +9,9 @@ identifier mismatches) and decided not to depend on it not doing that again.
 
 import re
 
-from config import MAX_ROWS, MAX_STAR_COLUMNS, _FORBIDDEN
+from imcm_commons import imcm_logger as logger
+
+from config import MAX_ROWS, MAX_STAR_COLUMNS, TRAILING_LIMIT_RE, _FORBIDDEN
 
 
 def is_safe_select(sql):
@@ -57,8 +59,24 @@ def qualify_and_quote_table_refs(sql, database, schema, table_names):
 
 
 def enforce_limit(sql):
-    if re.search(r"\blimit\b", sql, re.IGNORECASE):
+    """Guarantee a LIMIT, and clamp an over-large one the model invented.
+
+    Without the clamp, the response could advertise `LIMIT 500` while
+    fetchmany(MAX_ROWS) silently returned 200 -- SQL that doesn't match the
+    rows shown next to it.
+    """
+    m = TRAILING_LIMIT_RE.search(sql)
+    if m:
+        n = int(m.group(1))
+        if n > MAX_ROWS:
+            logger.log_info(f"Model asked for LIMIT {n}; clamping to {MAX_ROWS}")
+            return TRAILING_LIMIT_RE.sub(f" LIMIT {MAX_ROWS}", sql)
         return sql
+    if re.search(r"\blimit\b", sql, re.IGNORECASE):
+        # A LIMIT exists but not in trailing position (e.g. inside a subquery),
+        # so the outer result set is still unbounded.
+        logger.log_info("Non-trailing LIMIT present; appending an outer LIMIT")
+        return f"{sql}\nLIMIT {MAX_ROWS}"
     return f"{sql}\nLIMIT {MAX_ROWS}"
 
 
@@ -122,7 +140,13 @@ def normalize_select_list(sql, catalog, table_names):
             return sql, None
         resolved = []
         for t in raw_tokens:
-            real = exact_case.get(t.upper())
+            # Accept both "COL" and "TABLE.COL" -- the model routinely emits the
+            # qualified form ("SELECT EM_EVENT.ID, EM_EVENT.STATE__V, ..."), and
+            # looking that up unstripped always missed, so this function bailed
+            # on effectively every real single-table query and never narrowed or
+            # re-quoted anything.
+            bare = t.split(".")[-1].strip().strip('"')
+            real = exact_case.get(bare.upper())
             if real is None:
                 return sql, None  # unknown token (alias/expression) -- bail safely
             if real not in resolved:

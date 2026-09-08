@@ -9,7 +9,14 @@ import time
 
 from imcm_commons import imcm_logger as logger, snowflake_utils
 
-from config import CATALOG_TTL_SECONDS, REGION_NAME, SNOWFLAKE_SECRET, SNOWFLAKE_SECRET_PK
+from config import (
+    CATALOG_TTL_SECONDS,
+    REGION_NAME,
+    SAMPLE_POOL_SIZE,
+    SNOWFLAKE_SECRET,
+    SNOWFLAKE_SECRET_PK,
+    TRAILING_LIMIT_RE,
+)
 
 # Reuse the connection across warm invocations; cache catalogs, value
 # samples, and FK lookups per (database, schema, ...) combination queried.
@@ -18,6 +25,7 @@ _STATE = {
     "db_info": None,
     "catalogs": {},        # key -> {"data": catalog, "ts": epoch_seconds}
     "value_samples": {},   # key -> {"data": samples, "ts": epoch_seconds}
+    "sample_pool": [],     # extra warm connections, see get_sample_pool()
 }
 
 
@@ -57,6 +65,34 @@ def get_conn():
     _STATE["conn"] = conn
     _STATE["db_info"] = db_info
     return conn, db_info
+
+
+def _connection_alive(conn):
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1")
+        finally:
+            cur.close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def get_sample_pool(n):
+    """Return up to n Snowflake connections dedicated to parallel value
+    sampling (see sampling.value_samples_block), reusing/lazily growing a
+    small warm-container pool capped at SAMPLE_POOL_SIZE. Kept separate from
+    the single connection in get_conn() -- a connector connection isn't safe
+    for concurrent cursors from multiple threads, so each in-flight table
+    needs its own connection while sampling runs in parallel."""
+    n = min(n, SAMPLE_POOL_SIZE)
+    pool = _STATE["sample_pool"]
+    pool[:] = [c for c in pool if _connection_alive(c)]
+    while len(pool) < n:
+        conn, *_ = snowflake_utils.snowflake_connect(REGION_NAME, SNOWFLAKE_SECRET, SNOWFLAKE_SECRET_PK)
+        pool.append(conn)
+    return pool[:n]
 
 
 def default_target(db_info):
@@ -205,13 +241,25 @@ def get_declared_relationships(conn, database, schema, table_filter=None):
 
 
 def get_total_count(conn, sql):
-    """Run a COUNT(*) over the generated query (BEFORE any LIMIT is added)
-    wrapped as a subquery, so the caller knows how many rows actually match
-    even though only MAX_ROWS are returned. Works for plain filters and for
-    GROUP BY/aggregate queries alike (counts whatever rows the inner query
-    produces). Best-effort: on failure, returns None rather than failing
-    the whole request -- the capped row set is still useful without a count."""
-    count_sql = f"SELECT COUNT(*) FROM ({sql}) AS _count_wrapper"
+    """COUNT(*) over the generated query, wrapped as a subquery, so the caller
+    knows how many rows actually match even though only MAX_ROWS are returned.
+    Works for plain filters and GROUP BY/aggregate queries alike. Best-effort:
+    on failure, returns None rather than failing the whole request.
+
+    The model's own trailing LIMIT is stripped first. The SQL-generation prompt
+    instructs the model to include `LIMIT {MAX_ROWS}`, and it does -- so
+    counting the SQL verbatim returned exactly that limit every time, making
+    total_matching_rows meaningless and `truncated` permanently False. Observed
+    in production logs as `total_matching_rows=200, truncated=False` on a query
+    with LIMIT 200, where the real match count was higher.
+
+    Known edge case: a query *ending* in a string literal that itself contains
+    'LIMIT <n>' would be mis-stripped. Rare enough to accept.
+    """
+    counted_sql = TRAILING_LIMIT_RE.sub("", sql)
+    if counted_sql != sql:
+        logger.log_info("Stripped the model's trailing LIMIT before counting total rows")
+    count_sql = f"SELECT COUNT(*) FROM ({counted_sql}) AS _count_wrapper"
     cur = conn.cursor()
     try:
         cur.execute(count_sql)

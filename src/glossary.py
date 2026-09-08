@@ -24,8 +24,6 @@ import snowflake_client
 TABLE_ALIAS_MAP = {
     "events": "EM_EVENT",
     "event": "EM_EVENT",
-    "studies": "EM_EVENT",
-    "meetings": "EM_EVENT",
     "accounts": "ACCOUNT",
     "hcps": "ACCOUNT",
     "hcos": "ACCOUNT",
@@ -88,7 +86,9 @@ COLUMN_DESCRIPTIONS = {
 # the model to invent its own notion of "details" every time. Populate this
 # per-table as needed (e.g. DEFAULT_DETAIL_COLUMNS["EM_EVENT"] = [...]).
 # Empty/omitted tables fall back to the model's own judgment (default).
-DEFAULT_DETAIL_COLUMNS = {}
+DEFAULT_DETAIL_COLUMNS = {
+    "EM_EVENT" : ["ID", "NAME__V", "START_DATE__V", "EM_EVENT_STATUS__V"]
+}
 
 # --------------------------------------------------------------------------
 # A. Few-shot examples: curated (question, SQL) pairs anchoring the model to

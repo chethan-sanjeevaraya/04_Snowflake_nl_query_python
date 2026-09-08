@@ -20,6 +20,7 @@ import json
 
 from imcm_commons import imcm_logger as logger
 
+import session_memory as memory
 import snowflake_client
 from config import ALLOWED_TABLES, LOG_ROW_PREVIEW_LIMIT, MAX_ROWS, SQL_REPAIR_MAX_ATTEMPTS
 from sampling import value_samples_block
@@ -79,6 +80,9 @@ def lambda_handler(event, context):
     table_hint = _get_param(event, "Table", "table")
     database_hint = _get_param(event, "DATABASE", "Database", "database")
     schema_hint = _get_param(event, "SCHEMA", "Schema", "schema")
+    include_total_count = str(
+        _get_param(event, "includeTotalCount", "include_total_count") or "true"
+    ).strip().lower() not in ("false", "0", "no")
     if not query:
         return _respond(event, {"error": "Request must include a non-empty 'query' field."}, 400)
 
@@ -186,8 +190,10 @@ def lambda_handler(event, context):
 
         # Count total matching rows BEFORE the LIMIT is applied, so the caller
         # knows if the returned set was truncated. Best-effort -- never blocks
-        # the main query if it fails (e.g. on an exotic SQL shape).
-        total_count = snowflake_client.get_total_count(conn, sql)
+        # the main query if it fails (e.g. on an exotic SQL shape). Callers
+        # that don't need this (e.g. already know results are bounded) can
+        # skip the extra round-trip with includeTotalCount=false.
+        total_count = snowflake_client.get_total_count(conn, sql) if include_total_count else None
         exec_sql = enforce_limit(sql)
 
         try:

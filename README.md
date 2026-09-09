@@ -7,6 +7,23 @@ The UI calls the API **server-side**, from the Streamlit process. Nothing about
 the endpoint reaches the user's browser, so there is no CORS configuration to do
 and no API key embedded in client-side JavaScript.
 
+## Two frontends
+
+This Streamlit app (`frontend/`) and a React + TypeScript app (`frontend-react/`)
+are both maintained, side by side, against the same Lambda -- pick whichever
+fits how you want to run or share it:
+
+| | `frontend/` (this one) | `frontend-react/` |
+|---|---|---|
+| Calls the Lambda | Server-side, from the Streamlit process | Directly from the browser |
+| Requires | `streamlit run app.py` kept running | Any static file host (or none, for local dev) |
+| CORS setup needed | No | Yes, once -- see `frontend-react/README.md` |
+| API URL/key visible in the browser | No | Yes (see that README's security note) |
+
+Both implement the same feature set: conversation memory, clarification
+questions, table hints, target discovery, SQL/result rendering. See
+`frontend-react/README.md` for that app's setup, build, and deploy steps.
+
 ## Run it
 
 ```bash

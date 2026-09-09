@@ -1,7 +1,7 @@
 """Session memory + automatic table shortlisting for the text-to-SQL Lambda.
 
 Kept in its own module so it can be unit-tested without Snowflake, Bedrock or
-DynamoDB, and so lambda_function_fixed.py stays readable.
+DynamoDB, and so lambda_function.py stays readable.
 
 WHAT IS STORED IN DYNAMODB (for data-governance review)
 -------------------------------------------------------
@@ -255,6 +255,7 @@ def new_session(database, schema):
         "created_at": now,
         "updated_at": now,
         "turns": [],
+        "pending": None,
     }
 
 
@@ -290,6 +291,11 @@ def load_session(session_id):
     except (ValueError, TypeError):
         turns = []
 
+    try:
+        pending = json.loads(item.get("pending_json", {}).get("S", "null"))
+    except (ValueError, TypeError):
+        pending = None
+
     return {
         "session_id": item["session_id"]["S"],
         "database": item.get("database", {}).get("S", ""),
@@ -297,6 +303,7 @@ def load_session(session_id):
         "created_at": int(item.get("created_at", {}).get("N", "0") or 0),
         "updated_at": int(item.get("updated_at", {}).get("N", "0") or 0),
         "turns": turns if isinstance(turns, list) else [],
+        "pending": pending if isinstance(pending, dict) else None,
     }
 
 
@@ -353,6 +360,7 @@ def save_session(session):
         return False, ["session table not configured"]
 
     turns_json, notes = _serialize_turns(session.get("turns", []))
+    pending_json = json.dumps(session.get("pending"), default=str)
     now = int(time.time())
     try:
         _client().put_item(
@@ -365,11 +373,84 @@ def save_session(session):
                 "updated_at": {"N": str(now)},
                 "ttl": {"N": str(now + SESSION_TTL_SECONDS)},
                 "turns_json": {"S": turns_json},
+                "pending_json": {"S": pending_json},
             },
         )
         return True, notes
     except Exception as exc:  # noqa: BLE001
         return False, notes + [f"put_item failed: {exc}"]
+
+
+# --------------------------------------------------------------------------
+# Pending clarification: set when the Lambda couldn't confidently resolve a
+# table and asked the user a follow-up question instead of erroring out. The
+# NEXT turn on this session is checked against it before anything else, so a
+# short reply like "the events one" or "2" answers the question rather than
+# being treated as a brand-new (and probably unresolvable) query.
+# --------------------------------------------------------------------------
+
+def set_pending(session, question, candidates):
+    """Record that the NEXT turn on this session should be interpreted as the
+    answer to a clarification question, not a fresh question."""
+    session["pending"] = {
+        "question": question,
+        "candidates": list(candidates or []),
+        "ts": int(time.time()),
+    }
+
+
+def get_pending(session):
+    return (session or {}).get("pending")
+
+
+def clear_pending(session):
+    if session is not None:
+        session["pending"] = None
+
+
+# Words that show up specifically in a clarification REPLY ("the events ONE",
+# "I MEAN accounts", "the accounts TABLE please") but, unlike _STOPWORDS,
+# aren't excluded from a normal question because they can matter there. Kept
+# separate rather than folded into _STOPWORDS for that reason.
+_CLARIFICATION_FILLER_WORDS = {"one", "ones", "mean", "meant", "yes", "no", "just", "table", "tables"}
+
+
+def is_bare_table_pick(answer, matched_table):
+    """True when `answer` is basically just pointing at a table -- a number,
+    its name, an alias, a plural/singular variant, or that plus filler words
+    -- rather than restating or extending the original question.
+
+    Matters because `resolve_clarification_answer` matches on ANY reply that
+    names a real table, including a full sentence that happens to name one
+    ("show me EM_EVENT events from GB, closed only"). Answering the ORIGINAL
+    (pre-clarification) question in that case would silently drop the filter
+    the user just added. So: a bare pick re-asks the original question against
+    the picked table; anything else is treated as the real question in its
+    own right, with that table already resolved.
+
+    A heuristic, like looks_like_followup above -- a false negative here just
+    means the reply is treated as a fresh question (correct if it truly is
+    one; at worst a slightly odd standalone query if it wasn't). A false
+    positive would silently drop a filter the user just typed, so this errs
+    toward FALSE (treat it as a real question) whenever a word in the reply
+    isn't accounted for by the table's own name.
+    """
+    answer = (answer or "").strip()
+    if not answer:
+        return True
+    if re.match(r"^\s*#?\d+\s*\.?\s*$", answer):
+        return True
+
+    table_tokens = _tokens(matched_table or "")
+    words = [w for w in re.split(r"[^a-zA-Z0-9]+", answer.lower()) if w]
+    for w in words:
+        if w in _STOPWORDS or w in _CLARIFICATION_FILLER_WORDS or len(w) < 2:
+            continue
+        singular = w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+        if w in table_tokens or singular in table_tokens:
+            continue
+        return False  # a real content word the table's own name doesn't explain
+    return True
 
 
 def previous_tables(session):

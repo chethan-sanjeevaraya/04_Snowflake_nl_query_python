@@ -44,6 +44,20 @@ python api_client.py "https://.../dev/query" "how many events were created last 
 
 Omit the question to just list the DATABASE.SCHEMA pairs the Lambda accepts.
 
+To exercise conversation memory / clarification from the CLI, carry the printed
+`session_id` forward on the next call:
+
+```bash
+python api_client.py "https://.../dev/query" "how many events were held?"
+# -> needs_clarification: ... candidates: ['EM_EVENT', ...]; session_id: abc123
+
+python api_client.py "https://.../dev/query" "EM_EVENT" --session-id abc123
+# -> answers the ORIGINAL question ("how many events were held?") against EM_EVENT
+
+python api_client.py "https://.../dev/query" "now just GB" --session-id abc123
+# -> refines the previous turn's query using the same session
+```
+
 ## ⚠️ This is a dev-testing setup — it has no authentication
 
 You chose "just me / dev testing", so nothing here authenticates the caller. Two
@@ -69,6 +83,8 @@ things to be aware of before this goes anywhere near other people:
 | `database`, `schema`, `tables_used` | Caption line under the answer |
 | `error`, `detail`, `reason`, `sql` | Error block, with the failing SQL expanded |
 | `available_tables`, `valid_targets` | Expander / caption on the error |
+| `session_id` | Stored client-side, sent back on the next request (conversation memory) |
+| `needs_clarification`, `message`, `candidates` | Assistant message asking which table you meant, with a button per candidate |
 
 Target discovery has no dedicated endpoint, so `discover_targets()` sends a
 deliberately invalid `DATABASE`/`SCHEMA` pair; the Lambda's `_resolve_target`
@@ -100,6 +116,39 @@ Read the `x-amzn-ErrorType` response header — it names the exception precisely
 Note that an enterprise outbound proxy can also return its own 403 with an HTML
 body; in that case the UI reports "non-JSON response" instead.
 
+## Conversation memory and clarifying questions
+
+The Lambda can now hold a real multi-turn conversation, backed by DynamoDB,
+instead of treating every request as a one-off:
+
+- **Session memory.** Every response includes a `session_id`; the UI stores it
+  and sends it back on the next call. The Lambda uses it to remember prior
+  turns (question, SQL, tables, row counts) and feeds that history into the
+  SQL-generation prompt, so "now filter that to last quarter" or "same but for
+  GB" refines the previous query instead of starting blind. A follow-up that
+  refers to specific returned rows ("what was the second one about?") gets the
+  previous SQL re-run fresh and those rows passed to the model for that one
+  turn only — **no result rows are ever persisted** to DynamoDB; see the
+  module docstring in `session_memory.py` for the exact data-governance
+  boundary.
+- **Ambiguous-table clarification.** When the Lambda can't confidently tell
+  which table a question needs, it no longer just returns an HTTP error. It
+  responds with `{"needs_clarification": true, "message": ..., "candidates":
+  [...]}` (HTTP 200) and remembers, server-side, that it's waiting on an
+  answer. Your next message — a table name, an alias, or just its number in
+  the candidate list — resolves it and the Lambda answers the *original*
+  question against that table. The UI renders this as an assistant message
+  with clickable buttons for the suggested tables.
+- **Turning it on**: set the `SESSION_TABLE` env var to a DynamoDB table name
+  (partition key `session_id`, string; enable TTL on the `ttl` attribute).
+  Leave it unset and the Lambda behaves exactly as before — stateless, no
+  `session_id` in responses, every clarification failure is a plain error.
+  Related tuning knobs: `SESSION_TTL_SECONDS`, `SESSION_MAX_TURNS`,
+  `SESSION_MAX_ITEM_BYTES`, `REQUERY_ROW_PREVIEW` (all in `session_memory.py`).
+- **DATABASE/SCHEMA stays restricted** to the same trusted pairs as before —
+  conversation memory doesn't change what targets are queryable, only how
+  follow-ups within one target are handled.
+
 ## Known rough edges (backend, not UI)
 
 These are limits of the current Lambda that the UI can only surface, not fix:
@@ -113,10 +162,6 @@ These are limits of the current Lambda that the UI can only surface, not fix:
   explains the likely cause on a timeout. Passing a **Table hint** skips the
   table-selection Bedrock call and scopes the metadata query — the single
   biggest win on a large schema.
-- **No conversation memory.** The Lambda is stateless. The sidebar's *Send
-  previous question as context* toggle prepends your last question to the new
-  one client-side. It's a workaround; real multi-turn needs the handler to accept
-  a `history` array and feed prior Q/SQL pairs into `_generate_sql`.
 - **No streaming.** The response arrives all at once, so the spinner is the only
   progress signal. Per-stage timing logs in the Lambda would tell you which
   stage actually dominates.

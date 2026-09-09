@@ -60,6 +60,42 @@ def resolve_tables(names, catalog):
     return resolved
 
 
+def resolve_clarification_answer(answer, candidates, catalog):
+    """Match a user's free-text reply to a prior clarification question
+    ("Did you mean EM_EVENT or ACCOUNT?") against a real table.
+
+    Tries, in order: a numbered pick ("2", "2."), the whole reply against the
+    FULL catalog (exact/case-insensitive/alias/substring, via resolve_tables --
+    so naming a table outside the suggested list still works), then each
+    individual word of the reply (skipping very short ones) the same way.
+    Returns a one-item list on a match, or [] if nothing resolves -- callers
+    should treat [] as "this wasn't an answer to the question" and fall back
+    to treating the message as a fresh query.
+    """
+    answer = (answer or "").strip()
+    if not answer:
+        return []
+
+    m = re.match(r"^\s*#?(\d+)\b", answer)
+    if m:
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(candidates):
+            return [candidates[idx]]
+
+    hit = resolve_tables([answer], catalog)
+    if hit:
+        return hit[:1]
+
+    for word in re.split(r"[^a-zA-Z0-9_]+", answer):
+        if len(word) <= 2:
+            continue
+        hit = resolve_tables([word], catalog)
+        if hit:
+            return hit[:1]
+
+    return []
+
+
 def compact_catalog_text(catalog):
     """Table + column NAMES only (no types) -- kept small even at 100+ tables,
     used purely to let the model pick which table(s) are relevant."""

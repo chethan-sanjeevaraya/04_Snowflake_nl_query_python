@@ -48,6 +48,7 @@ for key, default in [
     ("api_key", _initial_api_key()),
     ("targets", []),
     ("target_error", ""),
+    ("session_id", ""),
 ]:
     st.session_state.setdefault(key, default)
 
@@ -116,19 +117,23 @@ with st.sidebar:
 
     st.divider()
     st.header("Behaviour")
-    carry_context = st.toggle(
-        "Send previous question as context",
-        value=False,
-        help=(
-            "The Lambda is stateless, so follow-ups like 'now filter that to last "
-            "quarter' fail on their own. This prepends your previous question to "
-            "the new one client-side. A workaround, not real conversation memory."
-        ),
-    )
     show_sql_expanded = st.toggle("Expand SQL by default", value=False)
+    if st.session_state.session_id:
+        st.caption(
+            f"Conversation memory: session `{st.session_state.session_id[:8]}...` -- "
+            "follow-ups and 'what about that one' refer back to this thread server-side. "
+            "If the Lambda has no SESSION_TABLE configured, it silently ignores this and "
+            "every question is answered fresh."
+        )
+    else:
+        st.caption(
+            "Conversation memory: no session yet -- starts after your first question, "
+            "if the Lambda has SESSION_TABLE configured."
+        )
 
     if st.button("Clear chat", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.session_id = ""
         st.rerun()
 
 
@@ -181,6 +186,23 @@ def _render_success(result: QueryResult, msg_index: int) -> None:
         st.info("The query ran successfully but matched no rows.", icon=":material/info:")
 
 
+def _render_clarification(result: QueryResult, msg_index: int) -> None:
+    """The Lambda couldn't confidently pick a table and is asking which one you
+    meant, instead of just erroring out. Answering (typing a table name, or
+    clicking one of the buttons below the LATEST such message) resolves it
+    server-side via the session -- no need to repeat the original question."""
+    st.markdown(result.clarification_message or "Which table did you mean?")
+    st.caption(f"{result.elapsed:.1f}s")
+
+    is_latest = msg_index == len(st.session_state.messages) - 1
+    if is_latest and result.candidates:
+        cols = st.columns(len(result.candidates))
+        for i, (col, candidate) in enumerate(zip(cols, result.candidates)):
+            if col.button(candidate, key=f"clarify_{msg_index}_{i}", use_container_width=True):
+                st.session_state["_pending_answer"] = candidate
+                st.rerun()
+
+
 def _render_error(result: QueryResult) -> None:
     st.error(result.error, icon=":material/error:")
     if result.detail:
@@ -207,12 +229,11 @@ def _render_message(message: dict[str, Any], index: int) -> None:
     with st.chat_message(message["role"]):
         if message["role"] == "user":
             st.markdown(message["content"])
-            if message.get("sent_query") and message["sent_query"] != message["content"]:
-                with st.expander("Sent to the API as"):
-                    st.text(message["sent_query"])
             return
         result: QueryResult = message["result"]
-        if result.ok:
+        if result.needs_clarification:
+            _render_clarification(result, index)
+        elif result.ok:
             _render_success(result, index)
         else:
             _render_error(result)
@@ -235,30 +256,27 @@ for i, message in enumerate(st.session_state.messages):
 # --------------------------------------------------------------------------
 
 prompt = st.chat_input("e.g. how many events were created last month?")
+# A click on one of the clarification buttons acts exactly like typing that
+# table name as the next chat message.
+prompt = prompt or st.session_state.pop("_pending_answer", None)
 
 if prompt:
     if not st.session_state.api_url:
         st.error("Set the API Gateway invoke URL in the sidebar first.")
         st.stop()
 
-    sent_query = prompt
-    if carry_context:
-        previous = next(
-            (m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"),
-            None,
-        )
-        if previous:
-            sent_query = f"Previous question: {previous}\nFollow-up question: {prompt}"
-
-    st.session_state.messages.append(
-        {"role": "user", "content": prompt, "sent_query": sent_query}
-    )
+    st.session_state.messages.append({"role": "user", "content": prompt})
     _render_message(st.session_state.messages[-1], len(st.session_state.messages) - 1)
 
     client = SnowflakeNLClient(st.session_state.api_url, st.session_state.api_key, timeout)
     with st.chat_message("assistant"):
         with st.spinner("Generating SQL and querying Snowflake..."):
-            result = client.ask(sent_query, table_hint, database, schema)
+            result = client.ask(
+                prompt, table_hint, database, schema, session_id=st.session_state.session_id
+            )
+
+    if result.session_id:
+        st.session_state.session_id = result.session_id
 
     st.session_state.messages.append({"role": "assistant", "result": result})
     st.rerun()

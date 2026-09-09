@@ -58,6 +58,23 @@ class QueryResult:
     def truncated(self) -> bool:
         return bool(self.payload.get("truncated"))
 
+    # --- conversation memory / clarification accessors ---
+    @property
+    def session_id(self) -> str:
+        return self.payload.get("session_id", "")
+
+    @property
+    def needs_clarification(self) -> bool:
+        return bool(self.payload.get("needs_clarification"))
+
+    @property
+    def clarification_message(self) -> str:
+        return self.payload.get("message", "")
+
+    @property
+    def candidates(self) -> list[str]:
+        return self.payload.get("candidates") or []
+
 
 def _gateway_error_hint(status_code: int, message: str, headers: Any) -> str:
     """Turn an API Gateway rejection into something actionable.
@@ -226,16 +243,27 @@ class SnowflakeNLClient:
         table: str = "",
         database: str = "",
         schema: str = "",
+        session_id: str = "",
     ) -> QueryResult:
         """Run one natural-language question. Optional hints are omitted when
         blank -- the Lambda treats a missing DATABASE/SCHEMA as 'use the default
-        target', and requires the two to be supplied together or not at all."""
+        target', and requires the two to be supplied together or not at all.
+
+        `session_id` carries conversation memory across turns: pass back
+        whatever the previous QueryResult.session_id was (empty on the first
+        turn) and the Lambda's response echoes the id to keep using -- the
+        caller doesn't need to manage the session's contents, just relay the
+        id. If the Lambda has no SESSION_TABLE configured, it ignores this and
+        never returns one, which degrades gracefully to today's stateless
+        behaviour."""
         payload: dict[str, Any] = {"query": query}
         if table.strip():
             payload["Table"] = table.strip()
         if database.strip() and schema.strip():
             payload["DATABASE"] = database.strip()
             payload["SCHEMA"] = schema.strip()
+        if session_id.strip():
+            payload["session_id"] = session_id.strip()
         return self._post(payload)
 
     def discover_targets(self) -> tuple[list[str], str]:
@@ -277,6 +305,13 @@ if __name__ == "__main__":  # pragma: no cover - manual smoke test
     parser.add_argument("--schema", default="")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--session-id",
+        default="",
+        help="session_id from a previous response, to continue that conversation "
+        "(reply with a table name/number here if the previous call came back with "
+        "needs_clarification). Omit to start a fresh session.",
+    )
     args = parser.parse_args()
 
     client = SnowflakeNLClient(args.url, args.api_key, args.timeout)
@@ -286,6 +321,11 @@ if __name__ == "__main__":  # pragma: no cover - manual smoke test
         print(f"valid targets: {found}" if found else f"could not discover targets: {err}")
         raise SystemExit(0)
 
-    out = client.ask(args.question, args.table, args.database, args.schema)
+    out = client.ask(args.question, args.table, args.database, args.schema, session_id=args.session_id)
     print(f"--- {'OK' if out.ok else 'FAILED'} in {out.elapsed:.1f}s (HTTP {out.status_code}) ---")
+    if out.session_id:
+        print(f"session_id: {out.session_id}  (pass as --session-id to continue this conversation)")
+    if out.needs_clarification:
+        print(f"needs_clarification: {out.clarification_message}")
+        print(f"candidates: {out.candidates}")
     print(json.dumps(out.payload, indent=2, default=str)[:4000])
